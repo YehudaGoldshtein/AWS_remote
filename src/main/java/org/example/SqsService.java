@@ -77,4 +77,10 @@ public class SqsService {
                 .receiptHandle(message.receiptHandle())
                 .build());
     }
+
+    public static void emptyQueue(String queueName) {
+        client.purgeQueue(PurgeQueueRequest.builder()
+                .queueUrl(getSQSQueue(queueName))
+                .build());
+    }
 }
