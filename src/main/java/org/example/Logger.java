@@ -3,6 +3,7 @@ package org.example;
 import java.sql.Time;
 
 import static org.example.ManagerApp.LOCAL_TO_MANAGER_REQUEST_QUEUE;
+import static org.example.ManagerApp.MANAGER_TO_LOCAL_REQUEST_QUEUE;
 
 public class Logger {
     static Logger instance;
@@ -15,7 +16,7 @@ public class Logger {
     public void log(String message){
         System.out.println("LOG: " + getNiceTime(System.currentTimeMillis()) + "    " + message);
         try
-        {SqsService.sendMessage(LOCAL_TO_MANAGER_REQUEST_QUEUE, "LOG: " + getNiceTime(System.currentTimeMillis()) + "    " + message);
+        {SqsService.sendMessage(MANAGER_TO_LOCAL_REQUEST_QUEUE, "LOG: " + getNiceTime(System.currentTimeMillis()) + "    " + message);
         }
         catch (Exception e){}
 
