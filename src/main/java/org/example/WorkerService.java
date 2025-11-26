@@ -152,6 +152,142 @@ public class WorkerService {
         throw new RuntimeException(INSTANCE_LIST_EMPTY_ERROR);
     }
 
+    /**
+     * Count the number of currently running workers
+     * @return Number of workers in running or pending state
+     */
+    public int countRunningWorkers() {
+        List<Filter> filters = new ArrayList<>();
+        filters.add(Filter.builder()
+                .name("tag:Role")
+                .values(WORKER_TAG)
+                .build());
 
+        DescribeInstancesRequest request = DescribeInstancesRequest.builder()
+                .filters(filters)
+                .build();
+
+        DescribeInstancesResponse response = ec2.describeInstances(request);
+
+        int runningWorkers = 0;
+        for (Reservation reservation : response.reservations()) {
+            for (Instance instance : reservation.instances()) {
+                InstanceStateName state = instance.state().name();
+                // Count workers that are running or pending (starting up)
+                if (state == InstanceStateName.RUNNING || state == InstanceStateName.PENDING) {
+                    runningWorkers++;
+                }
+            }
+        }
+
+        return runningWorkers;
+    }
+
+    /**
+     * Start multiple workers
+     * @param count Number of workers to start
+     * @return List of started instances
+     */
+    public List<Instance> startWorkers(int count) {
+        if (count <= 0) {
+            return new ArrayList<>();
+        }
+
+        int currentWorkers = countRunningWorkers();
+        int availableSlots = MAX_WORKERS - currentWorkers;
+
+        if (availableSlots <= 0) {
+            Logger.getLogger().log("Cannot start workers: MAX_WORKERS limit (" + MAX_WORKERS + ") reached. Current workers: " + currentWorkers);
+            return new ArrayList<>();
+        }
+
+        // Don't start more than available slots
+        int workersToStart = Math.min(count, availableSlots);
+
+        Logger.getLogger().log("Starting " + workersToStart + " workers (requested: " + count + ", available slots: " + availableSlots + ")");
+
+        List<Instance> startedInstances = new ArrayList<>();
+
+        for (int i = 0; i < workersToStart; i++) {
+            try {
+                Instance worker = setupSingleWorker();
+                startedInstances.add(worker);
+                Logger.getLogger().log("Started worker " + (i + 1) + "/" + workersToStart + ": " + worker.instanceId());
+            } catch (Exception e) {
+                Logger.getLogger().log("Error starting worker " + (i + 1) + ": " + e.getMessage());
+            }
+        }
+
+        return startedInstances;
+    }
+
+    /**
+     * Terminate all running workers
+     * @return Number of workers terminated
+     */
+    public int terminateAllWorkers() {
+        List<Instance> runningWorkers = getRunningWorkers();
+        int count = runningWorkers.size();
+
+        if (count == 0) {
+            Logger.getLogger().log("No workers to terminate");
+            return 0;
+        }
+
+        Logger.getLogger().log("Terminating " + count + " worker(s)...");
+
+        List<String> instanceIds = new ArrayList<>();
+        for (Instance instance : runningWorkers) {
+            instanceIds.add(instance.instanceId());
+        }
+
+        try {
+            TerminateInstancesRequest request = TerminateInstancesRequest.builder()
+                    .instanceIds(instanceIds)
+                    .build();
+
+            ec2.terminateInstances(request);
+            Logger.getLogger().log("Terminated " + count + " worker instance(s)");
+            return count;
+        } catch (Exception e) {
+            Logger.getLogger().log("Error terminating workers: " + e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * Get list of all running workers
+     */
+    private List<Instance> getRunningWorkers() {
+        List<Instance> runningWorkers = new ArrayList<>();
+
+        List<Filter> filters = new ArrayList<>();
+        filters.add(Filter.builder()
+                .name("tag:Role")
+                .values(WORKER_TAG)
+                .build());
+        filters.add(Filter.builder()
+                .name("instance-state-name")
+                .values(InstanceStateName.RUNNING.toString(), InstanceStateName.PENDING.toString())
+                .build());
+
+        DescribeInstancesRequest request = DescribeInstancesRequest.builder()
+                .filters(filters)
+                .build();
+
+        try {
+            DescribeInstancesResponse response = ec2.describeInstances(request);
+
+            for (Reservation reservation : response.reservations()) {
+                for (Instance instance : reservation.instances()) {
+                    runningWorkers.add(instance);
+                }
+            }
+        } catch (Exception e) {
+            Logger.getLogger().log("Error getting running workers: " + e.getMessage());
+        }
+
+        return runningWorkers;
+    }
 
 }

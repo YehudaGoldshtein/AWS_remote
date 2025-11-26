@@ -85,4 +85,32 @@ public class SqsService {
                 .queueUrl(getSQSQueue(queueName))
                 .build());
     }
+
+    /**
+     * Get the approximate number of messages in the queue
+     * @param queueName The name of the queue
+     * @return Approximate number of messages (including invisible messages)
+     */
+    public static int getQueueMessageCount(String queueName) {
+        try {
+            GetQueueAttributesResponse response = client.getQueueAttributes(
+                GetQueueAttributesRequest.builder()
+                    .queueUrl(getSQSQueue(queueName))
+                    .attributeNames(QueueAttributeName.APPROXIMATE_NUMBER_OF_MESSAGES,
+                                   QueueAttributeName.APPROXIMATE_NUMBER_OF_MESSAGES_NOT_VISIBLE)
+                    .build()
+            );
+
+            String visible = response.attributes().get(QueueAttributeName.APPROXIMATE_NUMBER_OF_MESSAGES);
+            String notVisible = response.attributes().get(QueueAttributeName.APPROXIMATE_NUMBER_OF_MESSAGES_NOT_VISIBLE);
+
+            int visibleCount = visible != null ? Integer.parseInt(visible) : 0;
+            int notVisibleCount = notVisible != null ? Integer.parseInt(notVisible) : 0;
+
+            return visibleCount + notVisibleCount;
+        } catch (Exception e) {
+            Logger.getLogger().log("Error getting queue message count: " + e.getMessage());
+            return 0;
+        }
+    }
 }
