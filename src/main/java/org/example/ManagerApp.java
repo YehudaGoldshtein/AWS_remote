@@ -6,6 +6,8 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -16,6 +18,7 @@ public class ManagerApp {
     public static final String LOCAL_TO_MANAGER_REQUEST_QUEUE = "LocalToManagerRequestQueue";
     public static final String MANAGER_TO_LOCAL_REQUEST_QUEUE = "ManagerToLocalRequestQueue";
     public static final String WORKER_TO_MANAGER_REQUEST_QUEUE = "WorkerToManagerRequestQueue";
+    static Thread getWorkerResponseThread = null;
 
     // Default files per worker (if not specified in message)
     private static final int DEFAULT_FILES_PER_WORKER = 5;
@@ -26,8 +29,15 @@ public class ManagerApp {
     // ExecutorService for parallel request handling
     private static final ExecutorService executorService = Executors.newCachedThreadPool();
 
+    // Track processed message IDs to prevent duplicate processing
+    private static final Set<String> processedMessageIds = ConcurrentHashMap.newKeySet();
+
     // Termination flag
     private static volatile boolean shouldTerminate = false;
+
+    // Worker response handler thread
+    private static Thread workerResponseThread = null;
+    private static volatile boolean workerResponseThreadStarted = false;
 
     public static void run(String[] args){
         if (args.length != 4){
@@ -47,88 +57,75 @@ public class ManagerApp {
         }
 
         // Thread for handling Local App messages (parallel processing)
-        
-            Logger.getLogger().log("Local app message handler thread started");
-            while (ExpectingMoreMessagesFromLocalApps()){
-                Logger.getLogger().log("immmmmmmmmmm here");
-                List<Message> messages = SqsService.getMessagesForQueue(LOCAL_TO_MANAGER_REQUEST_QUEUE);
-                if (!messages.isEmpty()){
-                    Logger.getLogger().log("Received " + messages.size() + " message(s) from local app");
-                    for (Message message : messages) {
-                        // Check for termination message
-                        if (message.body().equals("TERMINATE")) {
-                            Logger.getLogger().log("Received termination request from Local App");
-                            SqsService.deleteMessage(LOCAL_TO_MANAGER_REQUEST_QUEUE, message);
-                            shouldTerminate = true;
-                            // Continue processing to handle termination flow
-                            continue;
-                        }
 
-                        // If termination is requested, don't accept new jobs
-                        if (shouldTerminate) {
-                            Logger.getLogger().log("Termination requested - rejecting new job: " + message.body());
-                            SqsService.deleteMessage(LOCAL_TO_MANAGER_REQUEST_QUEUE, message);
-                            SqsService.sendMessage(MANAGER_TO_LOCAL_REQUEST_QUEUE,
-                                "ERROR;" + message.body() + ";Manager is terminating, cannot accept new jobs");
-                            continue;
-                        }
-
-                        // Delete message immediately to avoid reprocessing
-                        SqsService.deleteMessage(LOCAL_TO_MANAGER_REQUEST_QUEUE, message);
-
-                        // Process in parallel using ExecutorService
-                        executorService.submit(() -> {
-                            try {
-                                Logger.getLogger().log("Processing local app message in parallel: " + message.body());
-                                handleLocalAppMessage(message);
-                            } catch (Exception e) {
-                                Logger.getLogger().log("Error processing local app message: " + e.getMessage());
-                                SqsService.sendMessage(MANAGER_TO_LOCAL_REQUEST_QUEUE,
-                                    "ERROR;" + message.body() + ";" + e.getMessage());
-                            }
-                        });
-                    }
-                }
-                else{
-                    Logger.getLogger().log("No messages received from local app");
-                }
-
-                // If termination requested, check if all jobs are complete
-                if (shouldTerminate) {
-                    if (JobInfo.getAllJobs().isEmpty()) {
-                        Logger.getLogger().log("All jobs completed, proceeding with termination");
-                        break;
-                    } else {
-                        int activeJobs = JobInfo.getAllJobs().size();
-                        Logger.getLogger().log("Waiting for " + activeJobs + " active job(s) to complete...");
-                    }
-                }
-
-                // Small sleep to avoid busy waiting
-                try {
-                    Thread.sleep(100); // 100ms
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-            // Don't call postProccess here - let the main thread handle it
-            Logger.getLogger().log("Local app message handler thread exiting");
-        
-
-        // Main loop: wait for worker messages and handle job completion
-        Logger.getLogger().log("Manager main loop started - waiting for worker messages");
-        while (ExpectingMoreMessagesFromWorkers()){
-            //get messages from workers, name of queue is misleading, will fix later
-            List<Message> messages = SqsService.getMessagesForQueue(WORKER_TO_MANAGER_REQUEST_QUEUE);
+        Logger.getLogger().log("Local app message handler thread started");
+        while (ExpectingMoreMessagesFromLocalApps()){
+            List<Message> messages = SqsService.getMessagesForQueue(LOCAL_TO_MANAGER_REQUEST_QUEUE);
             if (!messages.isEmpty()){
+                Logger.getLogger().log("Received " + messages.size() + " message(s) from local app");
                 for (Message message : messages) {
-                    Logger.getLogger().log("Received message from worker: " + message.body());
-                    handleWorkerMessage(message);
-                    SqsService.deleteMessage(WORKER_TO_MANAGER_REQUEST_QUEUE, message);
+                    // Check if we've already processed this message (by message ID)
+                    String messageId = message.messageId();
+                    if (processedMessageIds.contains(messageId)) {
+                        Logger.getLogger().log("Skipping duplicate message: " + messageId);
+                        SqsService.deleteMessage(LOCAL_TO_MANAGER_REQUEST_QUEUE, message);
+                        continue;
+                    }
+
+                    // Mark message as being processed BEFORE any other operation
+                    processedMessageIds.add(messageId);
+
+                    // Check for termination message
+                    if (message.body().equals("TERMINATE")) {
+                        Logger.getLogger().log("Received termination request from Local App");
+                        SqsService.deleteMessage(LOCAL_TO_MANAGER_REQUEST_QUEUE, message);
+                        shouldTerminate = true;
+                        // Continue processing to handle termination flow
+                        continue;
+                    }
+
+                    // If termination is requested, don't accept new jobs
+                    if (shouldTerminate) {
+                        Logger.getLogger().log("Termination requested - rejecting new job: " + message.body());
+                        SqsService.deleteMessage(LOCAL_TO_MANAGER_REQUEST_QUEUE, message);
+                        SqsService.sendMessage(MANAGER_TO_LOCAL_REQUEST_QUEUE,
+                            "ERROR;" + message.body() + ";Manager is terminating, cannot accept new jobs");
+                        continue;
+                    }
+
+                    // Delete message immediately to avoid reprocessing
+                    SqsService.deleteMessage(LOCAL_TO_MANAGER_REQUEST_QUEUE, message);
+
+                    // Process in parallel using ExecutorService
+                    executorService.submit(() -> {
+                        try {
+                            Logger.getLogger().log("Processing local app message in parallel: " + message.body());
+                            handleLocalAppMessage(message);
+                        } catch (Exception e) {
+                            Logger.getLogger().log("Error processing local app message: " + e.getMessage());
+                            SqsService.sendMessage(MANAGER_TO_LOCAL_REQUEST_QUEUE,
+                                "ERROR;" + message.body() + ";" + e.getMessage());
+                        }
+                    });
+                    //if we reached here that means we have to start listening to workers results
+                    if (getWorkerResponseThread == null) {
+                        initiateWorkerResponseThread();
+                        if (getWorkerResponseThread != null) getWorkerResponseThread.start();
+                    }
                 }
             }
-            
+
+            // If termination requested, check if all jobs are complete
+            if (shouldTerminate) {
+                if (JobInfo.getAllJobs().isEmpty()) {
+                    Logger.getLogger().log("All jobs completed, proceeding with termination");
+                    break;
+                } else {
+                    int activeJobs = JobInfo.getAllJobs().size();
+                    Logger.getLogger().log("Waiting for " + activeJobs + " active job(s) to complete...");
+                }
+            }
+
             // Small sleep to avoid busy waiting
             try {
                 Thread.sleep(100); // 100ms
@@ -137,11 +134,13 @@ public class ManagerApp {
                 break;
             }
         }
-        Logger.getLogger().log("Manager main loop exiting - calling postProccess");
-        postProccess();
-        if (shouldTerminate){
-            terminateSelf();
-        }
+        // Don't call postProccess here - let the main thread handle it
+        Logger.getLogger().log("Local app message handler thread exiting");
+
+
+        // Main loop: wait for worker messages and handle job completion
+        Logger.getLogger().log("Manager main loop started - waiting for worker messages");
+
 
     }
 
@@ -515,5 +514,36 @@ public class ManagerApp {
         WorkerService.getInstance().terminateManager();
         //shut down via ec2
 
+    }
+
+    public static void initiateWorkerResponseThread(){
+        getWorkerResponseThread = new Thread(
+                ()->{
+                    while (ExpectingMoreMessagesFromWorkers()){
+                        //get messages from workers, name of queue is misleading, will fix later
+                        List<Message> messages = SqsService.getMessagesForQueue(WORKER_TO_MANAGER_REQUEST_QUEUE);
+                        if (!messages.isEmpty()){
+                            for (Message message : messages) {
+                                Logger.getLogger().log("Received message from worker: " + message.body());
+                                handleWorkerMessage(message);
+                                SqsService.deleteMessage(WORKER_TO_MANAGER_REQUEST_QUEUE, message);
+                            }
+                        }
+
+                        // Small sleep to avoid busy waiting
+                        try {
+                            Thread.sleep(100); // 100ms
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                    Logger.getLogger().log("Manager main loop exiting - calling postProccess");
+                    postProccess();
+                    if (shouldTerminate){
+                        terminateSelf();
+                    }
+                }
+        );
     }
 }

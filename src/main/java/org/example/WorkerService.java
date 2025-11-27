@@ -11,9 +11,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class WorkerService {
 
+    // Lock to prevent race conditions when starting workers
+    private static final ReentrantLock workerCreationLock = new ReentrantLock();
 
     public static final String WORKER_ROLE = "EMR_EC2_DefaultRole";
     static final String WORKER_TAG = "WorkerInstance";
@@ -21,7 +24,7 @@ public class WorkerService {
     public static final String MANAGER_REQUEST_QUEUE = "ManagerRequestQueue";
     public static final String WORKER_REQUEST_QUEUE = "WorkerRequestQueue";
     public static final String MANAGER_TO_WORKER_REQUEST_QUEUE = "ManagerToWorkerRequestQueue";
-    static final int MAX_WORKERS = 19;//amazon labm limit is 19 instances per account
+    static final int MAX_WORKERS = 15; // Safety buffer: AWS lab limit is 19, using 15 to be safe
     static final InstanceType WORKER_INSTANCE_TYPE = InstanceType.T1_MICRO;
     static final String MAX_WORKERS_ENV = "MAX_WORKERS";
     static final String INSTANCE_LIST_EMPTY_ERROR = "Error: EC2 instance list is empty after runInstances call.";
@@ -84,7 +87,8 @@ public class WorkerService {
         RunInstancesRequest runRequest = RunInstancesRequest.builder()
                 .instanceType(WORKER_INSTANCE_TYPE)
                 .imageId(workerAmiId)
-                 .iamInstanceProfile(profile) //<-- REMOVE THIS LINE
+                .iamInstanceProfile(profile)
+                .keyName("keyPair2")  // SSH keypair for access
                 .maxCount(1)
                 .minCount(1)
                 .userData(userDataBase64)
@@ -115,32 +119,29 @@ public class WorkerService {
     }
 
     /**
-     * Count the number of currently running workers
+     * Count only workers (for scaling decisions)
      * @return Number of workers in running or pending state
      */
     public int countRunningWorkers() {
-
-        DescribeInstancesRequest request = DescribeInstancesRequest.builder()
-                .build();
-
-        DescribeInstancesResponse response = ec2.describeInstances(request);
-
-        int runningWorkers = 0;
-        for (Reservation reservation : response.reservations()) {
-            for (Instance instance : reservation.instances()) {
-                InstanceStateName state = instance.state().name();
-                // Count workers that are running or pending (starting up)
-                if (state == InstanceStateName.RUNNING || state == InstanceStateName.PENDING) {
-                    runningWorkers++;
-                }
-            }
-        }
-
-        return runningWorkers;
+        int workerCount = getRunningMachines(WORKER_TAG).size();
+        Logger.getLogger().log("Current running workers: " + workerCount);
+        return workerCount;
     }
 
     /**
-     * Start multiple workers
+     * Count total instances (workers + manager) for MAX limit check
+     * @return Total number of our instances in running or pending state
+     */
+    public int countTotalInstances() {
+        int workerCount = getRunningMachines(WORKER_TAG).size();
+        int managerCount = getRunningMachines(MANAGER_TAG).size();
+        int total = workerCount + managerCount;
+        Logger.getLogger().log("Total instances: " + total + " (workers: " + workerCount + ", managers: " + managerCount + ")");
+        return total;
+    }
+
+    /**
+     * Start multiple workers (thread-safe with lock to prevent race conditions)
      * @param count Number of workers to start
      * @return List of started instances
      */
@@ -149,32 +150,39 @@ public class WorkerService {
             return new ArrayList<>();
         }
 
-        int currentWorkers = countRunningWorkers();
-        int availableSlots = MAX_WORKERS - currentWorkers;
+        // Acquire lock to prevent race conditions when multiple threads try to start workers
+        workerCreationLock.lock();
+        try {
+            // Use total instances (workers + manager) for MAX limit check
+            int totalInstances = countTotalInstances();
+            int availableSlots = MAX_WORKERS - totalInstances;
 
-        if (availableSlots <= 0) {
-            Logger.getLogger().log("Cannot start workers: MAX_WORKERS limit (" + MAX_WORKERS + ") reached. Current workers: " + currentWorkers);
-            return new ArrayList<>();
-        }
-
-        // Don't start more than available slots
-        int workersToStart = Math.min(count, availableSlots);
-
-        Logger.getLogger().log("Starting " + workersToStart + " workers (requested: " + count + ", available slots: " + availableSlots + ")");
-
-        List<Instance> startedInstances = new ArrayList<>();
-
-        for (int i = 0; i < workersToStart; i++) {
-            try {
-                Instance worker = setupSingleWorker();
-                startedInstances.add(worker);
-                Logger.getLogger().log("Started worker " + (i + 1) + "/" + workersToStart + ": " + worker.instanceId());
-            } catch (Exception e) {
-                Logger.getLogger().log("Error starting worker " + (i + 1) + ": " + e.getMessage());
+            if (availableSlots <= 0) {
+                Logger.getLogger().log("Cannot start workers: MAX_WORKERS limit (" + MAX_WORKERS + ") reached. Total instances: " + totalInstances);
+                return new ArrayList<>();
             }
-        }
 
-        return startedInstances;
+            // Don't start more than available slots
+            int workersToStart = Math.min(count, availableSlots);
+
+            Logger.getLogger().log("Starting " + workersToStart + " workers (requested: " + count + ", available slots: " + availableSlots + ")");
+
+            List<Instance> startedInstances = new ArrayList<>();
+
+            for (int i = 0; i < workersToStart; i++) {
+                try {
+                    Instance worker = setupSingleWorker();
+                    startedInstances.add(worker);
+                    Logger.getLogger().log("Started worker " + (i + 1) + "/" + workersToStart + ": " + worker.instanceId());
+                } catch (Exception e) {
+                    Logger.getLogger().log("Error starting worker " + (i + 1) + ": " + e.getMessage());
+                }
+            }
+
+            return startedInstances;
+        } finally {
+            workerCreationLock.unlock();
+        }
     }
 
     /**
