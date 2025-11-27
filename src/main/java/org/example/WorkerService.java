@@ -247,8 +247,8 @@ public class WorkerService {
     }
 
     public int terminateManager() {
-        List<Instance> runningWorkers = getRunningMachines(MANAGER_TAG);
-        int count = runningWorkers.size();
+        List<Instance> runningManagers = getRunningMachines(MANAGER_TAG);
+        int count = runningManagers.size();
 
         if (count == 0) {
             Logger.getLogger().log("No manager to terminate");
@@ -258,7 +258,7 @@ public class WorkerService {
         Logger.getLogger().log("Terminating " + count + " manager(s)...");
 
         List<String> instanceIds = new ArrayList<>();
-        for (Instance instance : runningWorkers) {
+        for (Instance instance : runningManagers) {
             instanceIds.add(instance.instanceId());
         }
 
