@@ -47,9 +47,10 @@ public class ManagerApp {
         }
 
         // Thread for handling Local App messages (parallel processing)
-        new Thread(()->{
+        
             Logger.getLogger().log("Local app message handler thread started");
             while (ExpectingMoreMessagesFromLocalApps()){
+                Logger.getLogger().log("immmmmmmmmmm here");
                 List<Message> messages = SqsService.getMessagesForQueue(LOCAL_TO_MANAGER_REQUEST_QUEUE);
                 if (!messages.isEmpty()){
                     Logger.getLogger().log("Received " + messages.size() + " message(s) from local app");
@@ -88,6 +89,9 @@ public class ManagerApp {
                         });
                     }
                 }
+                else{
+                    Logger.getLogger().log("No messages received from local app");
+                }
 
                 // If termination requested, check if all jobs are complete
                 if (shouldTerminate) {
@@ -110,8 +114,7 @@ public class ManagerApp {
             }
             // Don't call postProccess here - let the main thread handle it
             Logger.getLogger().log("Local app message handler thread exiting");
-        })
-                .start();
+        
 
         // Main loop: wait for worker messages and handle job completion
         Logger.getLogger().log("Manager main loop started - waiting for worker messages");
