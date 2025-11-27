@@ -98,11 +98,9 @@ public class ManagerApp {
                     Thread.currentThread().interrupt();
                     break;
                 }
-                if (!JobInfo.getAllJobs().isEmpty()){
-                    break;
-                }
             }
-            postProccess();
+            // Don't call postProccess here - let the main thread handle it
+            Logger.getLogger().log("Local app message handler thread exiting");
         })
                 .start();
 
@@ -116,7 +114,25 @@ public class ManagerApp {
                     SqsService.deleteMessage(WORKER_TO_MANAGER_REQUEST_QUEUE, message);
                 }
             }
-            else SqsService.sendMessage(MANAGER_TO_LOCAL_REQUEST_QUEUE, "I Am the manager and i have no messages from workers at this time.");
+            // Don't send status messages when there are no worker messages - just wait
+            // Only send status if we're waiting for jobs to complete
+            if (JobInfo.getAllJobs().isEmpty() && !shouldTerminate) {
+                // No active jobs and no termination requested - wait a bit before checking again
+                try {
+                    Thread.sleep(1000); // 1 second
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            } else {
+                // Small sleep to avoid busy waiting
+                try {
+                    Thread.sleep(100); // 100ms
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
 
         }
         postProccess();
@@ -126,17 +142,22 @@ public class ManagerApp {
 
     }
 
-    //temp var, remove later
-    static int expectedNumberOfMessages = 10;
     private static boolean ExpectingMoreMessagesFromWorkers() {
-        //for now, always return true,
-        //suggested implementation: have a list of returned files from workers, when reached expected number, return false.
-        //manage that list using the handleWorkerMessage method.
-        if (expectedNumberOfMessages > 0){
-            expectedNumberOfMessages--;
-            return true;
+        // Continue if:
+        // 1. Termination not requested, OR
+        // 2. Termination requested but there are still active jobs
+        if (shouldTerminate) {
+            // If termination requested, check if all jobs are complete
+            if (JobInfo.getAllJobs().isEmpty()) {
+                Logger.getLogger().log("All jobs completed, exiting worker message loop");
+                return false;
+            } else {
+                // Still have active jobs, continue waiting
+                return true;
+            }
         }
-        return false;
+        // No termination requested - continue waiting for messages
+        return true;
     }
 
     static void handleWorkerMessage(Message message){
@@ -464,14 +485,25 @@ public class ManagerApp {
 
             if (workersToStart > 0) {
                 Logger.getLogger().log("Starting " + workersToStart + " new workers...");
-                List<software.amazon.awssdk.services.ec2.model.Instance> started = workerService.startWorkers(workersToStart);
-                Logger.getLogger().log("Successfully started " + started.size() + " workers");
+                try {
+                    List<software.amazon.awssdk.services.ec2.model.Instance> started = workerService.startWorkers(workersToStart);
+                    if (started.isEmpty()) {
+                        Logger.getLogger().log("WARNING: No workers were started despite requesting " + workersToStart);
+                    } else {
+                        Logger.getLogger().log("Successfully started " + started.size() + " worker(s). Instance IDs: " + 
+                            started.stream().map(i -> i.instanceId()).reduce("", (a, b) -> a + (a.isEmpty() ? "" : ", ") + b));
+                    }
+                } catch (Exception e) {
+                    Logger.getLogger().log("ERROR: Exception while starting workers: " + e.getMessage());
+                    e.printStackTrace();
+                }
             } else {
                 Logger.getLogger().log("No new workers needed. Current: " + currentWorkers + ", Needed: " + neededWorkers);
             }
 
         } catch (Exception e) {
             Logger.getLogger().log("Error scaling workers: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
